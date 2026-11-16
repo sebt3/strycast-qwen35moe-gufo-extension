@@ -917,6 +917,9 @@ QwenGpuArena::QwenGpuArena(const core::ModelConfig& config,
       sparse_config.local_blocks = read("STRYCAST_SPARSE_LOCAL", 32);
       sparse_config.top_blocks = read("STRYCAST_SPARSE_TOPK", 256);
       sparse_config.min_context = read("STRYCAST_SPARSE_MIN_CONTEXT", 8192);
+      sparse_config.decode_min_context =
+          read("STRYCAST_SPARSE_DECODE_MIN_CONTEXT", 16384);
+      sparse_config.decode_enabled = read("STRYCAST_SPARSE_DECODE", 1) != 0;
       HIP_CHECK(hipMalloc(&d_sparse_pooled,
                           SparseAttentionPooledBytes(
                               config_.FullAttentionLayerCount(),
@@ -930,9 +933,12 @@ QwenGpuArena::QwenGpuArena(const core::ModelConfig& config,
       sparse_enabled = true;
       std::fprintf(stderr,
                    "[strycast] block-sparse prefill attention: sink %u local %u "
-                   "top %u blocks of 64, from %u keys\n",
+                   "top %u blocks of 64, prefill from %u keys, decode %s from %u "
+                   "keys\n",
                    sparse_config.sink_blocks, sparse_config.local_blocks,
-                   sparse_config.top_blocks, sparse_config.min_context);
+                   sparse_config.top_blocks, sparse_config.min_context,
+                   sparse_config.decode_enabled ? "on" : "off",
+                   sparse_config.decode_min_context);
     }
 
     const std::size_t total_conv =

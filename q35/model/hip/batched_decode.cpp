@@ -794,6 +794,25 @@ QwenGpuExecutor::ForwardVerificationBatch(
                 reinterpret_cast<float*>(scratch.decode.weight_bf16.data()),
                 sequence_size * attention_scratch.size()};
           }
+          const bool sparse_rows =
+              state_arena.sparse_enabled &&
+              state_arena.sparse_config.decode_enabled &&
+              !state_arena.UsesQ8AttentionKv() &&
+              static_cast<std::size_t>(start_pos) + sequence_size >
+                  state_arena.sparse_config.decode_min_context &&
+              LaunchQwenSparseDecodeAttention(
+                  (scratch.attention.q.data() + offset * attention_size),
+                  (scratch.ssm.gate.data() + offset * attention_size),
+                  state_arena.d_attention_kv_f16,
+                  state_arena.AttentionVPlane(),
+                  (scratch.ssm.out.data() + offset * attention_size),
+                  state_arena.d_sparse_pooled, state_arena.d_sparse_lists,
+                  &state_arena.sparse_pooled_end[attention_layer], attention_layer,
+                  start_pos, sequence_size, state_arena.GetMaxContext(),
+                  config.num_attention_heads, config.num_key_value_heads,
+                  config.head_dim, state_arena.sparse_config, arena_.stream,
+                  attention_scratch);
+          if (!sparse_rows)
           LaunchCausalDecodeAttention(
               (scratch.attention.q.data() + offset * attention_size),
               (scratch.ssm.gate.data() + offset * attention_size),

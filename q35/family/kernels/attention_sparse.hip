@@ -16,10 +16,13 @@
 
 #include <cmath>
 #include <cstddef>
+#include <algorithm>
 #include <cstdint>
+#include <span>
 #include <type_traits>
 
 #include "q35/family/hip_common/attention_policy.hpp"
+#include "q35/family/kernels/kv_q8.hpp"
 #include "q35/family/kernels/ops/attention.hpp"
 
 namespace strycast::hip {
@@ -722,6 +725,387 @@ __launch_bounds__(256) __global__ void SelectSparseBlocks(
 
 }  // namespace
 
+namespace {
+namespace dec {
+
+// Decode and verification over the selected blocks: the matrix-core decode
+// kernel of attention_wmma_decode.hip with its key loop driven by the block
+// list (eight query heads per 256-wide KV head, up to kPositions positions
+// per launch as a 64-row query tile).
+constexpr std::uint32_t kHeadDim = 256;
+constexpr std::uint32_t kGroup = 8;
+#ifndef GUFO_WMMA_DECODE_POSITIONS
+#define GUFO_WMMA_DECODE_POSITIONS 4
+#endif
+constexpr std::uint32_t kPositions = GUFO_WMMA_DECODE_POSITIONS;
+constexpr std::uint32_t kRows = kGroup * kPositions;
+constexpr std::uint32_t kRowBlocks = kRows / 16;
+constexpr std::uint32_t kDimSplits = 8 / kRowBlocks;
+constexpr std::uint32_t kKeys = 16;
+constexpr std::uint32_t kKSteps = kHeadDim / 16;
+constexpr std::uint32_t kKStepsPerWave = kKSteps / kDimSplits;
+constexpr std::uint32_t kKStride = kHeadDim + 8;
+constexpr std::uint32_t kVtStride = kKeys + 8;
+constexpr std::uint32_t kSoftmaxLanes = 256 / kRows;
+constexpr std::uint32_t kKRegs = (kKeys * (kHeadDim / 8)) / 256;
+constexpr std::uint32_t kVRegs = (kKeys * kHeadDim) / (256 * 8);
+constexpr std::uint32_t kMinPartition = 256;
+static_assert(kRowBlocks * kDimSplits == 8 && kKRegs == 2 && kVRegs == 2 &&
+              kKeys % kSoftmaxLanes == 0);
+
+template<bool kQ8>
+__launch_bounds__(256, 2) __global__ void SparseDecodePartials(
+    const float* __restrict__ q, const void* __restrict__ k_layer,
+    const void* __restrict__ v_layer, float* __restrict__ scratch,
+    std::uint32_t start_pos, std::uint32_t positions,
+    const std::int32_t* __restrict__ block_lists, std::uint32_t list_stride,
+    std::uint32_t num_heads, std::uint32_t num_kv_heads) {
+  const std::uint32_t tid = threadIdx.x;
+  const std::uint32_t lane = tid & 31u;
+  const std::uint32_t wave = tid >> 5u;
+  const std::uint32_t sub = lane & 15u;
+  const std::uint32_t half_id = lane >> 4u;
+  const std::uint32_t split = blockIdx.x;
+  const std::uint32_t kv_head = blockIdx.y;
+  const std::size_t kv_width =
+      static_cast<std::size_t>(num_kv_heads) * kHeadDim;
+  const std::size_t attn_width = static_cast<std::size_t>(num_heads) * kHeadDim;
+  constexpr float attention_scale = 1.0F / 16.0F;
+
+  // Keys are visited through the selected 64-key blocks: slot s is key
+  // list[1 + s / 64] * 64 + s % 64. A partition is a run of slots, so a 16-key
+  // tile is always contiguous in the cache.
+  const std::uint32_t key_end = start_pos + positions;
+  const std::int32_t* list = block_lists + kv_head * list_stride;
+  const std::uint32_t slots = static_cast<std::uint32_t>(list[0]) * 64u;
+  constexpr std::uint32_t max_splits_ =
+      detail::kSplitKDecodeAttentionMaxSplits;
+  const std::uint32_t per_split =
+      max(kMinPartition, ((slots + max_splits_ - 1) / max_splits_ + 15u) / 16u * 16u);
+  const std::uint32_t slot_begin = min(split * per_split, slots);
+  const std::uint32_t slot_end = min(slot_begin + per_split, slots);
+  const auto key_of = [&](std::uint32_t slot) {
+    return static_cast<std::uint32_t>(list[1 + slot / 64u]) * 64u + slot % 64u;
+  };
+  const auto row_position = [](std::uint32_t row) { return row / kGroup; };
+  const auto row_head = [&](std::uint32_t row) {
+    return kv_head * kGroup + (row % kGroup);
+  };
+
+  __shared__ __half kv_lds[kHeadDim * kVtStride];
+  __shared__ float s_lds[kDimSplits][kRowBlocks][16][17];
+  __shared__ __half p_lds[kRows][kKeys + 8];
+  __shared__ float row_max[kRows];
+  __shared__ float row_sum[kRows];
+  __shared__ float row_scale[kRows];
+  static_assert(kHeadDim * kVtStride >= kKeys * kKStride);
+
+  // Wave w computes the score tile of row block w % kRowBlocks over part
+  // w / kRowBlocks of the head dimension.
+  const std::uint32_t s_rb = wave % kRowBlocks;
+  const std::uint32_t s_kh = wave / kRowBlocks;
+
+  v16h q_frag[kKStepsPerWave];
+  {
+    const std::uint32_t row = s_rb * 16 + sub;
+    const bool live = row_position(row) < positions;
+    const float* q_row =
+        q + static_cast<std::size_t>(row_position(row)) * attn_width +
+        static_cast<std::size_t>(row_head(row)) * kHeadDim;
+#pragma unroll
+    for (std::uint32_t ks = 0; ks < kKStepsPerWave; ++ks) {
+      const std::uint32_t d0 = (s_kh * kKStepsPerWave + ks) * 16;
+      const auto* qp = reinterpret_cast<const float4*>(q_row + d0);
+#pragma unroll
+      for (std::uint32_t v = 0; v < 4; ++v) {
+        const float4 f = live ? qp[v] : make_float4(0.0F, 0.0F, 0.0F, 0.0F);
+        q_frag[ks][(v * 4) + 0] = static_cast<_Float16>(f.x * attention_scale);
+        q_frag[ks][(v * 4) + 1] = static_cast<_Float16>(f.y * attention_scale);
+        q_frag[ks][(v * 4) + 2] = static_cast<_Float16>(f.z * attention_scale);
+        q_frag[ks][(v * 4) + 3] = static_cast<_Float16>(f.w * attention_scale);
+      }
+    }
+  }
+
+  // This wave owns dimension tiles `wave` and `wave + 8` of every row block.
+  v8f o_acc[kRowBlocks][2] = {};
+  float running_max = -INFINITY;
+  float running_sum = 0.0F;
+
+  const std::uint32_t v_key = lane % kKeys;
+  const std::uint32_t v_slice = (tid / kKeys) * (kVRegs * 8);
+  const auto* k_base = static_cast<const __half*>(k_layer) +
+                       static_cast<std::size_t>(kv_head) * kHeadDim;
+  const auto* v_base = static_cast<const __half*>(v_layer) +
+                       static_cast<std::size_t>(kv_head) * kHeadDim + v_slice;
+  // 8-bit rows: thread tid stages 16 dimensions of key tid / 16.
+  const std::size_t q8_stride =
+      static_cast<std::size_t>(num_kv_heads) * kv_q8::kRowBytes;
+  const auto* k_rows = static_cast<const std::uint8_t*>(k_layer) +
+                       static_cast<std::size_t>(kv_head) * kv_q8::kRowBytes;
+  const auto* v_rows = static_cast<const std::uint8_t*>(v_layer) +
+                       static_cast<std::size_t>(kv_head) * kv_q8::kRowBytes;
+  const std::uint32_t q8_key = tid / 16u;
+  const std::uint32_t q8_dim = (tid % 16u) * 16u;
+  using KRegs = std::conditional_t<kQ8, kv_q8::Slice16, uint4[kKRegs]>;
+  using VRegs = std::conditional_t<kQ8, kv_q8::Slice16, uint4[kVRegs]>;
+  // Keys at or past key_end are never read: positions past the last row may
+  // not be written yet.
+  const auto load_v = [&](std::uint32_t key_start, VRegs& dst) {
+    const std::uint32_t key = key_start + v_key;
+    if constexpr (kQ8) {
+      dst = key < key_end
+                ? kv_q8::LoadSlice16(v_rows + key * q8_stride, v_slice)
+                : kv_q8::Slice16{make_uint4(0u, 0u, 0u, 0u), 0.0F};
+    } else {
+      const auto* src = v_base + static_cast<std::size_t>(key) * kv_width;
+#pragma unroll
+      for (std::uint32_t j = 0; j < kVRegs; ++j)
+        dst[j] = key < key_end ? *reinterpret_cast<const uint4*>(src + j * 8)
+                               : make_uint4(0u, 0u, 0u, 0u);
+    }
+  };
+  const auto load_k = [&](std::uint32_t key_start, KRegs& dst) {
+    if constexpr (kQ8) {
+      const std::uint32_t key = key_start + q8_key;
+      dst = key < key_end
+                ? kv_q8::LoadSlice16(k_rows + key * q8_stride, q8_dim)
+                : kv_q8::Slice16{make_uint4(0u, 0u, 0u, 0u), 0.0F};
+    } else {
+#pragma unroll
+      for (std::uint32_t n = 0; n < kKRegs; ++n) {
+        const std::uint32_t idx = tid + n * 256;
+        const std::uint32_t key = key_start + idx / (kHeadDim / 8);
+        const std::uint32_t d8 = (idx % (kHeadDim / 8)) * 8;
+        dst[n] = key < key_end ? *reinterpret_cast<const uint4*>(
+                                     k_base +
+                                     static_cast<std::size_t>(key) * kv_width +
+                                     d8)
+                               : make_uint4(0u, 0u, 0u, 0u);
+      }
+    }
+  };
+
+  KRegs k_cur;
+  VRegs v_cur;
+  KRegs k_pre{};
+  VRegs v_pre{};
+  if (slot_begin < slot_end) {
+    load_k(key_of(slot_begin), k_cur);
+    load_v(key_of(slot_begin), v_cur);
+  }
+
+  for (std::uint32_t slot = slot_begin; slot < slot_end; slot += kKeys) {
+    const std::uint32_t key_start = key_of(slot);
+    __syncthreads();
+    if constexpr (kQ8) {
+      uint4 halves[2];
+      kv_q8::Dequantize16(k_cur, halves);
+      auto* dst = reinterpret_cast<uint4*>(&kv_lds[q8_key * kKStride + q8_dim]);
+      dst[0] = halves[0];
+      dst[1] = halves[1];
+    } else {
+#pragma unroll
+      for (std::uint32_t n = 0; n < kKRegs; ++n) {
+        const std::uint32_t idx = tid + n * 256;
+        *reinterpret_cast<uint4*>(&kv_lds[(idx / (kHeadDim / 8)) * kKStride +
+                                          (idx % (kHeadDim / 8)) * 8]) =
+            k_cur[n];
+      }
+    }
+    __syncthreads();
+
+    if (slot + kKeys < slot_end) {
+      load_k(key_of(slot + kKeys), k_pre);
+      load_v(key_of(slot + kKeys), v_pre);
+    }
+
+    {
+      v8f s_acc = {};
+#pragma unroll
+      for (std::uint32_t ks = 0; ks < kKStepsPerWave; ++ks) {
+        const std::uint32_t d0 = (s_kh * kKStepsPerWave + ks) * 16;
+        s_acc = Wmma(q_frag[ks], LoadFrag(&kv_lds[sub * kKStride + d0]), s_acc);
+      }
+#pragma unroll
+      for (std::uint32_t i = 0; i < 8; ++i)
+        s_lds[s_kh][s_rb][(2 * i) + half_id][sub] = s_acc[i];
+    }
+    __syncthreads();
+
+    // Online softmax: four threads per row, each over four keys.
+    {
+      const std::uint32_t rg = tid / kSoftmaxLanes;
+      const std::uint32_t seg = tid % kSoftmaxLanes;
+      constexpr std::uint32_t kPerLane = kKeys / kSoftmaxLanes;
+      const std::uint32_t rb = rg / 16;
+      const std::uint32_t row = rg % 16;
+      const bool live = row_position(rg) < positions;
+      const std::uint32_t limit = start_pos + row_position(rg);
+      float part_max = -INFINITY;
+      float vals[kPerLane];
+#pragma unroll
+      for (std::uint32_t m = 0; m < kPerLane; ++m) {
+        const std::uint32_t col = seg * kPerLane + m;
+        const std::uint32_t key = key_start + col;
+        const bool valid = live && key <= limit && key < key_end;
+        float score = s_lds[0][rb][row][col];
+#pragma unroll
+        for (std::uint32_t h = 1; h < kDimSplits; ++h)
+          score += s_lds[h][rb][row][col];
+        vals[m] = valid ? score : -INFINITY;
+        part_max = fmaxf(part_max, vals[m]);
+      }
+#pragma unroll
+      for (std::uint32_t off = 1; off < kSoftmaxLanes; off <<= 1)
+        part_max = fmaxf(part_max, __shfl_xor(part_max, off));
+      const float prev_max = running_max;
+      const float next_max = fmaxf(prev_max, part_max);
+      const float prior_scale =
+          isfinite(prev_max) ? __expf(prev_max - next_max) : 0.0F;
+      float part_sum = 0.0F;
+#pragma unroll
+      for (std::uint32_t m = 0; m < kPerLane; ++m) {
+        const float w = isfinite(vals[m]) ? __expf(vals[m] - next_max) : 0.0F;
+        part_sum += w;
+        p_lds[rg][seg * kPerLane + m] = static_cast<__half>(w);
+      }
+#pragma unroll
+      for (std::uint32_t off = 1; off < kSoftmaxLanes; off <<= 1)
+        part_sum += __shfl_xor(part_sum, off);
+      running_max = next_max;
+      running_sum = (running_sum * prior_scale) + part_sum;
+      if (seg == 0)
+        row_scale[rg] = prior_scale;
+    }
+    __syncthreads();
+
+#pragma unroll
+    for (std::uint32_t rb = 0; rb < kRowBlocks; ++rb) {
+#pragma unroll
+      for (std::uint32_t i = 0; i < 8; ++i) {
+        const float scale = row_scale[(rb * 16) + (2 * i) + half_id];
+        o_acc[rb][0][i] *= scale;
+        o_acc[rb][1][i] *= scale;
+      }
+    }
+
+    // V^T: lane L owns key L % 16 and each thread a 16-dimension slice, so
+    // consecutive lanes write consecutive columns (conflict-free).
+    {
+      uint4 v_halves[kVRegs];
+      if constexpr (kQ8) {
+        kv_q8::Dequantize16(v_cur, v_halves);
+      } else {
+#pragma unroll
+        for (std::uint32_t j = 0; j < kVRegs; ++j)
+          v_halves[j] = v_cur[j];
+      }
+#pragma unroll
+      for (std::uint32_t j = 0; j < kVRegs; ++j) {
+        const auto* packed = reinterpret_cast<const __half*>(&v_halves[j]);
+#pragma unroll
+        for (std::uint32_t i = 0; i < 8; ++i)
+          kv_lds[(v_slice + j * 8 + i) * kVtStride + v_key] = packed[i];
+      }
+    }
+    __syncthreads();
+
+#pragma unroll
+    for (std::uint32_t t = 0; t < 2; ++t) {
+      const std::uint32_t dim_tile = wave + t * 8;
+      const v16h v_frag = LoadFrag(&kv_lds[(dim_tile * 16 + sub) * kVtStride]);
+#pragma unroll
+      for (std::uint32_t rb = 0; rb < kRowBlocks; ++rb) {
+        const v16h p_frag = LoadFrag(&p_lds[(rb * 16) + sub][0]);
+        v8f next = Wmma(p_frag, v_frag, o_acc[rb][t]);
+        // Row block rb holds positions 2 rb and 2 rb + 1. A row whose own
+        // position falls inside this tile sums only its visible keys, in
+        // order, so it does not depend on what later keys hold (a single
+        // decoded row has not written them yet). A row whose position
+        // precedes the tile keeps its accumulator: its probabilities are all
+        // zero there, and a single decoded row never visits the tile.
+        if (key_start + kKeys - 1 > start_pos + 2 * rb) {
+          v8f tail = o_acc[rb][t];
+#pragma unroll
+          for (std::uint32_t key = 0; key < kKeys; ++key) {
+            const float value = static_cast<float>(v_frag[key]);
+#pragma unroll
+            for (std::uint32_t i = 0; i < 8; ++i) {
+              const std::uint32_t row = rb * 16 + 2 * i + half_id;
+              if (key_start + key <= start_pos + row_position(row))
+                tail[i] = fmaf(__half2float(p_lds[row][key]), value, tail[i]);
+            }
+          }
+#pragma unroll
+          for (std::uint32_t i = 0; i < 8; ++i) {
+            const std::uint32_t limit =
+                start_pos + row_position(rb * 16 + 2 * i + half_id);
+            if (key_start > limit)
+              next[i] = o_acc[rb][t][i];
+            else if (key_start + kKeys - 1 > limit)
+              next[i] = tail[i];
+          }
+        }
+        o_acc[rb][t] = next;
+      }
+    }
+
+    if constexpr (kQ8) {
+      k_cur = k_pre;
+      v_cur = v_pre;
+    } else {
+#pragma unroll
+      for (std::uint32_t n = 0; n < kKRegs; ++n)
+        k_cur[n] = k_pre[n];
+#pragma unroll
+      for (std::uint32_t n = 0; n < kVRegs; ++n)
+        v_cur[n] = v_pre[n];
+    }
+  }
+  if (tid % kSoftmaxLanes == 0) {
+    row_max[tid / kSoftmaxLanes] = running_max;
+    row_sum[tid / kSoftmaxLanes] = running_sum;
+  }
+  __syncthreads();
+
+  constexpr std::size_t max_splits = detail::kSplitKDecodeAttentionMaxSplits;
+  const std::size_t row_scratch =
+      static_cast<std::size_t>(num_heads) * max_splits * (kHeadDim + 2);
+  const std::size_t stats_elements =
+      static_cast<std::size_t>(num_heads) * max_splits * 2;
+#pragma unroll
+  for (std::uint32_t rb = 0; rb < kRowBlocks; ++rb) {
+#pragma unroll
+    for (std::uint32_t t = 0; t < 2; ++t) {
+      const std::uint32_t dim = (wave + t * 8) * 16 + sub;
+#pragma unroll
+      for (std::uint32_t i = 0; i < 8; ++i) {
+        const std::uint32_t row = rb * 16 + 2 * i + half_id;
+        if (row_position(row) >= positions)
+          continue;
+        float* base = scratch + row_position(row) * row_scratch;
+        const std::size_t partition_index =
+            static_cast<std::size_t>(row_head(row)) * max_splits + split;
+        base[stats_elements + partition_index * kHeadDim + dim] =
+            o_acc[rb][t][i];
+      }
+    }
+  }
+  if (tid < kRows && row_position(tid) < positions) {
+    float* base = scratch + row_position(tid) * row_scratch;
+    const std::size_t partition_index =
+        static_cast<std::size_t>(row_head(tid)) * max_splits + split;
+    base[partition_index * 2 + 0] = row_max[tid];
+    base[partition_index * 2 + 1] = row_sum[tid];
+  }
+}
+
+
+}  // namespace dec
+
+}  // namespace
+
 template<std::uint32_t kQueryHeads, std::uint32_t kKvHeads>
 static bool LaunchSparseGeometry(
     const float* q, const float* gate, void* k_cache_f16, void* v_cache_f16,
@@ -790,6 +1174,68 @@ bool LaunchQwenSparseWmmaAttention(
         max_context, num_heads, num_kv_heads, head_dim, config, stream);
   }
   return false;
+}
+
+
+bool LaunchQwenSparseDecodeAttention(
+    const float* q, const float* gate, void* k_cache_f16, void* v_cache_f16,
+    float* out_context, void* pooled_keys, std::int32_t* block_lists,
+    std::uint32_t* pooled_valid_end, std::uint32_t layer_idx,
+    std::uint32_t start_pos, std::size_t positions, std::uint32_t max_context,
+    std::uint32_t num_heads, std::uint32_t num_kv_heads, std::uint32_t head_dim,
+    const SparseAttentionConfig& config, hipStream_t stream,
+    std::span<float> scratch) {
+  constexpr std::uint32_t kQ = 16;
+  constexpr std::uint32_t kKv = 2;
+  constexpr std::uint32_t kMaxSplits = detail::kSplitKDecodeAttentionMaxSplits;
+  const std::size_t row_scratch =
+      detail::DecodeAttentionScratchElements(num_heads, head_dim);
+  if (num_heads != kQ || num_kv_heads != kKv || head_dim != kHeadDim ||
+      positions == 0 || positions > kWmmaQueryRows || pooled_keys == nullptr ||
+      block_lists == nullptr || scratch.size() < positions * row_scratch ||
+      max_context > kSelectMaxBlocks * kSparseBlockKeys ||
+      start_pos + positions > max_context) {
+    return false;
+  }
+  constexpr std::uint32_t kKvWidth = kKv * kHeadDim;
+  const std::uint32_t max_blocks =
+      (max_context + kSparseBlockKeys - 1) / kSparseBlockKeys;
+  const std::size_t layer_cache_offset =
+      static_cast<std::size_t>(layer_idx) * max_context * kKvWidth;
+  const auto* layer_k = static_cast<const __half*>(k_cache_f16) + layer_cache_offset;
+  const auto* layer_v = static_cast<const __half*>(v_cache_f16) + layer_cache_offset;
+  auto* pooled = static_cast<__half*>(pooled_keys) +
+                 static_cast<std::size_t>(layer_idx) * kKv * max_blocks * 512;
+
+  const std::uint32_t end_pos =
+      start_pos + static_cast<std::uint32_t>(positions);
+  const std::uint32_t valid_end = *pooled_valid_end;
+  const std::uint32_t from_block = min(valid_end, start_pos) / kSparseBlockKeys;
+  const std::uint32_t to_block = (end_pos - 1) / kSparseBlockKeys;
+  UpdatePooledKeys<<<dim3(to_block - from_block + 1, kKv), kHeadDim, 0,
+                     stream>>>(layer_k, pooled, from_block, end_pos, kKv,
+                               max_blocks);
+  *pooled_valid_end = end_pos;
+  SelectSparseBlocks<kQ, kKv><<<dim3(1, kKv), 256, 0, stream>>>(
+      q, pooled, block_lists, start_pos, positions, max_blocks,
+      config.sink_blocks, config.local_blocks, config.top_blocks,
+      SparseAttentionListStride(config));
+
+  const std::size_t attn_width = static_cast<std::size_t>(kQ) * kHeadDim;
+  for (std::size_t first = 0; first < positions; first += dec::kPositions) {
+    const auto count = static_cast<std::uint32_t>(
+        std::min<std::size_t>(dec::kPositions, positions - first));
+    dec::SparseDecodePartials<false>
+        <<<dim3(kMaxSplits, kKv), 256, 0, stream>>>(
+            q + first * attn_width, layer_k, layer_v,
+            scratch.data() + first * row_scratch,
+            start_pos + static_cast<std::uint32_t>(first), count, block_lists,
+            SparseAttentionListStride(config), kQ, kKv);
+  }
+  LaunchSplitKAttentionReduce(gate, scratch.data(), out_context, kQ,
+                              static_cast<std::uint32_t>(positions), kMaxSplits,
+                              stream);
+  return true;
 }
 
 }  // namespace strycast::hip
