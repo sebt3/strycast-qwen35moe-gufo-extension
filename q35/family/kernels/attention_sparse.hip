@@ -1183,11 +1183,13 @@ bool LaunchQwenSparseDecodeAttention(
     std::uint32_t* pooled_valid_end, std::uint32_t layer_idx,
     std::uint32_t start_pos, std::size_t positions, std::uint32_t max_context,
     std::uint32_t num_heads, std::uint32_t num_kv_heads, std::uint32_t head_dim,
-    const SparseAttentionConfig& config, hipStream_t stream,
+    const SparseAttentionConfig& prefill_config, hipStream_t stream,
     std::span<float> scratch) {
   constexpr std::uint32_t kQ = 16;
   constexpr std::uint32_t kKv = 2;
   constexpr std::uint32_t kMaxSplits = detail::kSplitKDecodeAttentionMaxSplits;
+  SparseAttentionConfig config = prefill_config;
+  config.top_blocks = prefill_config.decode_top_blocks;
   const std::size_t row_scratch =
       detail::DecodeAttentionScratchElements(num_heads, head_dim);
   if (num_heads != kQ || num_kv_heads != kKv || head_dim != kHeadDim ||

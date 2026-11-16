@@ -193,7 +193,10 @@ struct SparseAttentionConfig {
   std::uint32_t min_context{8192};
   /// Decode and verification rows (35B shape only): from this many keys, and
   /// switchable on its own.
-  std::uint32_t decode_min_context{16384};
+  std::uint32_t decode_min_context{32768};
+  /// Decode rows select more blocks than prefill: identifiers copied from deep
+  /// in the context are the first thing a narrower selection loses.
+  std::uint32_t decode_top_blocks{512};
   bool decode_enabled{true};
 };
 [[nodiscard]] constexpr std::size_t SparseAttentionPooledBytes(

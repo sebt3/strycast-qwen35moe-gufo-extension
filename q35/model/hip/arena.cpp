@@ -918,8 +918,10 @@ QwenGpuArena::QwenGpuArena(const core::ModelConfig& config,
       sparse_config.top_blocks = read("STRYCAST_SPARSE_TOPK", 256);
       sparse_config.min_context = read("STRYCAST_SPARSE_MIN_CONTEXT", 8192);
       sparse_config.decode_min_context =
-          read("STRYCAST_SPARSE_DECODE_MIN_CONTEXT", 16384);
+          read("STRYCAST_SPARSE_DECODE_MIN_CONTEXT", 32768);
+      sparse_config.decode_top_blocks = read("STRYCAST_SPARSE_DECODE_TOPK", 512);
       sparse_config.decode_enabled = read("STRYCAST_SPARSE_DECODE", 1) != 0;
+      dense_tail_rows = read("STRYCAST_SPARSE_DENSE_TAIL", 1024);
       HIP_CHECK(hipMalloc(&d_sparse_pooled,
                           SparseAttentionPooledBytes(
                               config_.FullAttentionLayerCount(),
@@ -934,11 +936,12 @@ QwenGpuArena::QwenGpuArena(const core::ModelConfig& config,
       std::fprintf(stderr,
                    "[strycast] block-sparse prefill attention: sink %u local %u "
                    "top %u blocks of 64, prefill from %u keys, decode %s from %u "
-                   "keys\n",
+                   "keys (top %u)\n",
                    sparse_config.sink_blocks, sparse_config.local_blocks,
                    sparse_config.top_blocks, sparse_config.min_context,
                    sparse_config.decode_enabled ? "on" : "off",
-                   sparse_config.decode_min_context);
+                   sparse_config.decode_min_context,
+                   sparse_config.decode_top_blocks);
     }
 
     const std::size_t total_conv =
@@ -1093,6 +1096,7 @@ QwenGpuArena::QwenGpuArena(QwenGpuArena&& other) noexcept
   sparse_pooled_end = std::move(other.sparse_pooled_end);
   sparse_config = other.sparse_config;
   sparse_enabled = other.sparse_enabled;
+  dense_tail_rows = other.dense_tail_rows;
   d_kv_cache = other.d_kv_cache;
   d_ssm_conv_state = other.d_ssm_conv_state;
   d_ssm_deltanet_state = other.d_ssm_deltanet_state;
@@ -1207,6 +1211,7 @@ QwenGpuArena& QwenGpuArena::operator=(QwenGpuArena&& other) noexcept {
     sparse_pooled_end = std::move(other.sparse_pooled_end);
     sparse_config = other.sparse_config;
     sparse_enabled = other.sparse_enabled;
+    dense_tail_rows = other.dense_tail_rows;
     d_kv_cache = other.d_kv_cache;
     d_ssm_conv_state = other.d_ssm_conv_state;
     d_ssm_deltanet_state = other.d_ssm_deltanet_state;

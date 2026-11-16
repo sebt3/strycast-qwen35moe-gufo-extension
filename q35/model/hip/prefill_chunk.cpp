@@ -811,8 +811,8 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
       // written by the fused kernel, whole chunk wanted (the dense launcher
       // skips output tiles below output_first_row), deep enough to pay off.
       const bool sparse_attention =
-          arena_.sparse_enabled && kv_already_written &&
-          output_first_row == 0 && !arena_.UsesQ8AttentionKv() &&
+          arena_.sparse_enabled && !arena_.sparse_suspended &&
+          kv_already_written && output_first_row == 0 && !arena_.UsesQ8AttentionKv() &&
           visible_context > arena_.sparse_config.min_context &&
           LaunchQwenSparseWmmaAttention(
               arena_.d_q, arena_.d_ssm_gate, arena_.d_attention_kv_f16,
