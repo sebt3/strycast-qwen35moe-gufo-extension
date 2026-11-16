@@ -191,6 +191,10 @@ struct SparseAttentionConfig {
   std::uint32_t local_blocks{32};
   std::uint32_t top_blocks{256};
   std::uint32_t min_context{8192};
+  /// Decode and verification rows (35B shape only): from this many keys, and
+  /// switchable on its own.
+  std::uint32_t decode_min_context{16384};
+  bool decode_enabled{true};
 };
 [[nodiscard]] constexpr std::size_t SparseAttentionPooledBytes(
     std::uint32_t attention_layers, std::uint32_t kv_heads,
@@ -215,6 +219,20 @@ struct SparseAttentionConfig {
     std::uint32_t start_pos, std::size_t batch_size, std::uint32_t max_context,
     std::uint32_t num_heads, std::uint32_t num_kv_heads, std::uint32_t head_dim,
     const SparseAttentionConfig& config, hipStream_t stream = nullptr);
+
+/// Decode / speculative-verification rows over the same selection: `positions`
+/// (at most 32) consecutive rows from `start_pos` share one block list, chosen
+/// from their mean query, and run the matrix-core decode kernel over it. Only
+/// for eight query heads per KV head (16/2 shape); returns false otherwise or
+/// when `scratch` holds fewer than positions x DecodeAttentionScratchElements.
+[[nodiscard]] bool LaunchQwenSparseDecodeAttention(
+    const float* q, const float* gate, void* k_cache_f16, void* v_cache_f16,
+    float* out_context, void* pooled_keys, std::int32_t* block_lists,
+    std::uint32_t* pooled_valid_end, std::uint32_t layer_idx,
+    std::uint32_t start_pos, std::size_t positions, std::uint32_t max_context,
+    std::uint32_t num_heads, std::uint32_t num_kv_heads, std::uint32_t head_dim,
+    const SparseAttentionConfig& config, hipStream_t stream,
+    std::span<float> scratch);
 
 /// Large-batch causal attention using float32 QK/PV GEMMs and one reusable
 /// [batch, context] score buffer.
