@@ -795,7 +795,7 @@ QwenGpuExecutor::ForwardVerificationBatch(
                 sequence_size * attention_scratch.size()};
           }
           const bool sparse_rows =
-              state_arena.sparse_enabled &&
+              state_arena.sparse_enabled && !state_arena.sparse_suspended &&
               state_arena.sparse_config.decode_enabled &&
               !state_arena.UsesQ8AttentionKv() &&
               static_cast<std::size_t>(start_pos) + sequence_size >

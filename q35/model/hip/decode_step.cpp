@@ -245,8 +245,8 @@ void ExecuteDecodeStep(QwenGpuArena& arena,
       // host-side bound tracking, so never under graph capture (MoE decode is
       // not captured; other shapes are refused by the launcher).
       const bool sparse_decode =
-          arena.sparse_enabled && arena.sparse_config.decode_enabled &&
-          use_split_k_decode && fused_qknorm_rope_kv &&
+          arena.sparse_enabled && !arena.sparse_suspended &&
+          arena.sparse_config.decode_enabled && use_split_k_decode && fused_qknorm_rope_kv &&
           !arena.UsesQ8AttentionKv() &&
           sequence_length > arena.sparse_config.decode_min_context &&
           LaunchQwenSparseDecodeAttention(

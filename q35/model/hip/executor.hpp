@@ -407,6 +407,11 @@ public:
   std::vector<std::uint32_t> sparse_pooled_end;
   SparseAttentionConfig sparse_config{};
   bool sparse_enabled{false};
+  /// Set while the last rows of a prompt run: the question that follows a long
+  /// document has to see all of it, so these rows use the dense kernels.
+  bool sparse_suspended{false};
+  /// Prompt rows kept dense at the end of a prefill (STRYCAST_SPARSE_DENSE_TAIL).
+  std::uint32_t dense_tail_rows{1024};
   /// Cached rows changed under the bounds (restore, reset): pool again.
   void InvalidateSparseAttention() noexcept {
     std::fill(sparse_pooled_end.begin(), sparse_pooled_end.end(), 0u);
