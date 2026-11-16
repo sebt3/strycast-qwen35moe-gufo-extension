@@ -2,6 +2,7 @@
 #ifndef GUFO_MODELS_QWEN_HIP_EXECUTOR_HPP_
 #define GUFO_MODELS_QWEN_HIP_EXECUTOR_HPP_
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -30,6 +31,7 @@
 #include <gufo/ext/experimental/hip_graph_decode_executor.hpp>
 
 #include "q35/family/hip_common/execution_policy.hpp"
+#include "q35/family/kernels/ops/attention.hpp"
 #include "q35/family/kernels/ops/gemm.hpp"
 #include "q35/family/kernels/ops/ssm.hpp"
 #include "q35/family/kernels/ops/token.hpp"
@@ -397,6 +399,18 @@ public:
   float* d_ssm_alpha_beta{nullptr};
   float* d_logits{nullptr};
   void* d_attention_kv_f16{nullptr};
+  /// Opt-in block-sparse prefill attention (STRYCAST_SPARSE_ATTN): per-layer
+  /// key min/max bounds, per-tile block lists, and how many keys the bounds
+  /// of each full-attention layer already cover.
+  void* d_sparse_pooled{nullptr};
+  std::int32_t* d_sparse_lists{nullptr};
+  std::vector<std::uint32_t> sparse_pooled_end;
+  SparseAttentionConfig sparse_config{};
+  bool sparse_enabled{false};
+  /// Cached rows changed under the bounds (restore, reset): pool again.
+  void InvalidateSparseAttention() noexcept {
+    std::fill(sparse_pooled_end.begin(), sparse_pooled_end.end(), 0u);
+  }
   float* d_kv_cache{nullptr};
   // Mirrors of the live recurrent buffers (see BeginRecurrentWrite); reassigned
   // whenever the live buffer changes, so snapshots and resets read and write

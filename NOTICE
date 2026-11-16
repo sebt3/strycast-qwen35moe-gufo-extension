@@ -15,3 +15,6 @@ copyright and license terms:
   (LaurentZuijdwijk/llama.cpp, Nathanw1014/strix-halo-llamacpp,
   gaetan-puleo/llama-cpp-strix-halo); Nathan Wilson's notice is in
   licenses/strix-halo-llamacpp.txt.
+- Block-sparse prefill attention (q35/family/kernels/attention_sparse.hip) is
+  ported from mikealanni/gufo (https://github.com/mikealanni/gufo, branch
+  fork-enhancements, MIT), adapted to this extension's namespace and arena.
